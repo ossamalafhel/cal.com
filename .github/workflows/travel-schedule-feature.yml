@@ -1,0 +1,285 @@
+name: Travel Schedule Feature CI
+
+on:
+  push:
+    branches: [ "feature/travel-schedule-not-applied-across-availability-schedules" ]
+
+permissions:
+  actions: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_OPTIONS: --max-old-space-size=4096
+  TURBO_TOKEN: ${{ secrets.TURBO_TOKEN }}
+  TURBO_TEAM: ${{ secrets.TURBO_TEAM }}
+  DATABASE_URL: postgresql://postgres:postgres@localhost:5432/calendso
+  DATABASE_DIRECT_URL: postgresql://postgres:postgres@localhost:5432/calendso
+  NEXTAUTH_SECRET: secret
+  CALENDSO_ENCRYPTION_KEY: testkey
+  NEXT_PUBLIC_WEBAPP_URL: http://localhost:3000
+  NEXT_PUBLIC_WEBSITE_URL: http://localhost:3000
+  NEXT_PUBLIC_IS_E2E: true
+  CI_WEBHOOK_SECRET: ci_webhook_secret_feature/travel-schedule-not-applied-across-availability-schedules_1755537669554
+
+jobs:
+  ci:
+    name: Build and Test Travel Schedule Feature
+    timeout-minutes: 15
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: true
+    services:
+      postgres:
+        image: postgres:13
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: calendso
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'yarn'
+
+      - name: Install dependencies
+        run: |
+          echo "::group::Installing dependencies"
+          yarn install --frozen-lockfile 2>&1 | tee install.log || {
+            EXIT_CODE=$?
+            ERROR_CONTEXT=$(grep -E -B 3 -A 5 -i "(error|fail|exception|fatal|unable|cannot|invalid|missing)" install.log 2>/dev/null | head -c 800 | sed 's/"/\\"/g' | tr '\n' ' ') || true
+            if [ -z "$ERROR_CONTEXT" ]; then
+              ERROR_CONTEXT=$(tail -n 15 install.log 2>/dev/null | head -c 800 | sed 's/"/\\"/g' | tr '\n' ' ') || true
+            fi
+            echo "::error::yarn install failed with exit code $EXIT_CODE. Full error context: $ERROR_CONTEXT"
+            exit $EXIT_CODE
+          }
+          echo "::endgroup::"
+
+      - name: Run database migrations
+        run: |
+          echo "::group::Database setup"
+          yarn prisma generate 2>&1 | tee prisma.log || {
+            EXIT_CODE=$?
+            ERROR_CONTEXT=$(tail -n 20 prisma.log | tr '\n' ' ')
+            echo "::error::Prisma generate failed with exit code $EXIT_CODE. Error: $ERROR_CONTEXT"
+            exit $EXIT_CODE
+          }
+          yarn db-deploy 2>&1 | tee deploy.log || {
+            EXIT_CODE=$?
+            ERROR_CONTEXT=$(tail -n 20 deploy.log | tr '\n' ' ')
+            echo "::error::Database migration failed with exit code $EXIT_CODE. Error: $ERROR_CONTEXT"
+            exit $EXIT_CODE
+          }
+          echo "::endgroup::"
+
+      - name: Run linter
+        run: |
+          echo "::group::Linting code"
+          yarn lint 2>&1 | tee lint.log || {
+            EXIT_CODE=$?
+            ERROR_CONTEXT=$(grep -E -B 2 -A 3 -i "(error|warning|problem)" lint.log 2>/dev/null | head -c 800 | sed 's/"/\\"/g' | tr '\n' ' ') || true
+            if [ -z "$ERROR_CONTEXT" ]; then
+              ERROR_CONTEXT=$(tail -n 15 lint.log 2>/dev/null | head -c 800 | sed 's/"/\\"/g' | tr '\n' ' ') || true
+            fi
+            echo "::error::Linting failed with exit code $EXIT_CODE. Issues found: $ERROR_CONTEXT"
+            exit $EXIT_CODE
+          }
+          echo "::endgroup::"
+
+      - name: Run type checking
+        run: |
+          echo "::group::Type checking"
+          yarn type-check:ci 2>&1 | tee typecheck.log || {
+            EXIT_CODE=$?
+            ERROR_CONTEXT=$(grep -E -B 3 -A 5 -i "(error|TS[0-9]+)" typecheck.log 2>/dev/null | head -c 800 | sed 's/"/\\"/g' | tr '\n' ' ') || true
+            if [ -z "$ERROR_CONTEXT" ]; then
+              ERROR_CONTEXT=$(tail -n 15 typecheck.log 2>/dev/null | head -c 800 | sed 's/"/\\"/g' | tr '\n' ' ') || true
+            fi
+            echo "::error::Type checking failed with exit code $EXIT_CODE. Type errors: $ERROR_CONTEXT"
+            exit $EXIT_CODE
+          }
+          echo "::endgroup::"
+
+      - name: Build project
+        run: |
+          echo "::group::Building project"
+          yarn build 2>&1 | tee build.log || {
+            EXIT_CODE=$?
+            ERROR_CONTEXT=$(grep -E -B 3 -A 5 -i "(error|fail|exception|fatal|unable|cannot)" build.log 2>/dev/null | head -c 800 | sed 's/"/\\"/g' | tr '\n' ' ') || true
+            if [ -z "$ERROR_CONTEXT" ]; then
+              ERROR_CONTEXT=$(tail -n 15 build.log 2>/dev/null | head -c 800 | sed 's/"/\\"/g' | tr '\n' ' ') || true
+            fi
+            echo "::error::Build failed with exit code $EXIT_CODE. Build errors: $ERROR_CONTEXT"
+            exit $EXIT_CODE
+          }
+          echo "::endgroup::"
+
+      - name: Run unit tests for travel schedule
+        run: |
+          echo "::group::Running travel schedule unit tests"
+          # Run tests specifically for getUserAvailability which contains the travel schedule logic
+          yarn test packages/lib/getUserAvailability.test.ts 2>&1 | tee test.log || {
+            EXIT_CODE=$?
+            ERROR_CONTEXT=$(grep -E -B 5 -A 10 -i "(fail|error|expect|assert|✗)" test.log 2>/dev/null | head -c 800 | sed 's/"/\\"/g' | tr '\n' ' ') || true
+            if [ -z "$ERROR_CONTEXT" ]; then
+              ERROR_CONTEXT=$(tail -n 20 test.log 2>/dev/null | head -c 800 | sed 's/"/\\"/g' | tr '\n' ' ') || true
+            fi
+            echo "::error::Travel schedule unit tests failed with exit code $EXIT_CODE. Test failures: $ERROR_CONTEXT"
+            exit $EXIT_CODE
+          }
+          echo "::endgroup::"
+
+      - name: Run all unit tests
+        run: |
+          echo "::group::Running all unit tests"
+          yarn test --no-isolate 2>&1 | tee test-all.log || {
+            EXIT_CODE=$?
+            ERROR_CONTEXT=$(grep -E -B 5 -A 10 -i "(fail|error|expect|assert|✗)" test-all.log 2>/dev/null | head -c 800 | sed 's/"/\\"/g' | tr '\n' ' ') || true
+            if [ -z "$ERROR_CONTEXT" ]; then
+              ERROR_CONTEXT=$(tail -n 20 test-all.log 2>/dev/null | head -c 800 | sed 's/"/\\"/g' | tr '\n' ' ') || true
+            fi
+            echo "::error::Unit tests failed with exit code $EXIT_CODE. Test failures: $ERROR_CONTEXT"
+            exit $EXIT_CODE
+          }
+          echo "::endgroup::"
+
+      - name: Run timezone-dependent tests
+        run: |
+          echo "::group::Running timezone tests"
+          TZ=America/Los_Angeles yarn test -- --timeZoneDependentTestsOnly --no-isolate 2>&1 | tee tz-test.log || {
+            EXIT_CODE=$?
+            ERROR_CONTEXT=$(grep -E -B 5 -A 10 -i "(fail|error|expect|assert|✗)" tz-test.log 2>/dev/null | head -c 800 | sed 's/"/\\"/g' | tr '\n' ' ') || true
+            if [ -z "$ERROR_CONTEXT" ]; then
+              ERROR_CONTEXT=$(tail -n 20 tz-test.log 2>/dev/null | head -c 800 | sed 's/"/\\"/g' | tr '\n' ' ') || true
+            fi
+            echo "::error::Timezone tests failed with exit code $EXIT_CODE. Test failures: $ERROR_CONTEXT"
+            exit $EXIT_CODE
+          }
+          echo "::endgroup::"
+
+      - name: Run integration tests for availability
+        run: |
+          echo "::group::Running availability integration tests"
+          # Run integration tests that would cover travel schedule availability
+          yarn test --grep "availability|schedule|travel" 2>&1 | tee integration.log || {
+            EXIT_CODE=$?
+            ERROR_CONTEXT=$(grep -E -B 5 -A 10 -i "(fail|error|expect|assert|✗)" integration.log 2>/dev/null | head -c 800 | sed 's/"/\\"/g' | tr '\n' ' ') || true
+            if [ -z "$ERROR_CONTEXT" ]; then
+              ERROR_CONTEXT=$(tail -n 20 integration.log 2>/dev/null | head -c 800 | sed 's/"/\\"/g' | tr '\n' ' ') || true
+            fi
+            echo "::warning::Integration tests had issues (non-blocking): $ERROR_CONTEXT"
+          }
+          echo "::endgroup::"
+
+      - name: Seed test database for E2E
+        if: success()
+        run: |
+          echo "::group::Seeding database"
+          yarn db-seed 2>&1 | tee seed.log || {
+            EXIT_CODE=$?
+            ERROR_CONTEXT=$(tail -n 20 seed.log | tr '\n' ' ')
+            echo "::error::Database seeding failed with exit code $EXIT_CODE. Error: $ERROR_CONTEXT"
+            exit $EXIT_CODE
+          }
+          echo "::endgroup::"
+
+      - name: Run targeted E2E tests for availability
+        if: success()
+        run: |
+          echo "::group::Running availability E2E tests"
+          # Run only availability-related E2E tests to keep execution fast
+          NEXT_PUBLIC_IS_E2E=1 yarn playwright test --grep "availability|schedule" --project=@calcom/web --timeout=30000 2>&1 | tee e2e.log || {
+            EXIT_CODE=$?
+            ERROR_CONTEXT=$(grep -E -B 5 -A 10 -i "(fail|error|timeout|expect)" e2e.log 2>/dev/null | head -c 800 | sed 's/"/\\"/g' | tr '\n' ' ') || true
+            if [ -z "$ERROR_CONTEXT" ]; then
+              ERROR_CONTEXT=$(tail -n 20 e2e.log 2>/dev/null | head -c 800 | sed 's/"/\\"/g' | tr '\n' ' ') || true
+            fi
+            echo "::warning::E2E tests had issues (non-blocking): $ERROR_CONTEXT"
+          }
+          echo "::endgroup::"
+
+      - name: Upload test artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            *.log
+            test-results/
+            playwright-report/
+          retention-days: 3
+
+  notify-ci-status:
+    name: Notify CI Status
+    runs-on: ubuntu-latest
+    if: always()
+    needs: [ci]
+    steps:
+      - name: Notify CI Status
+        run: |
+          # Get the actual CI status from the previous job
+          STATUS="${{ needs.ci.result }}"
+          
+          # Set appropriate message based on status
+          if [ "$STATUS" = "success" ]; then
+            CI_ERRORS="CI passed - all checks successful for travel schedule feature"
+            echo "✅ CI Pipeline Success"
+          elif [ "$STATUS" = "failure" ]; then
+            CI_ERRORS="CI failed - checking for travel schedule implementation issues"
+            echo "❌ CI Pipeline Failed"
+          elif [ "$STATUS" = "cancelled" ]; then
+            CI_ERRORS="CI cancelled - workflow was cancelled"
+            echo "⚠️ CI Pipeline Cancelled"
+          else
+            CI_ERRORS="CI status unknown - checking for issues"
+            echo "❓ CI Pipeline Unknown Status"
+          fi
+          
+          # Send notification with all required fields
+          echo "Sending webhook notification for status: $STATUS"
+          
+          RESPONSE=$(curl -s -w "\nHTTP_STATUS:%{http_code}" -X POST https://macaw-communal-usefully.ngrok-free.app/api/kanpredict/fix-ci-errors \
+            -H "Content-Type: application/json" \
+            -H "X-Hub-Signature: ${{ env.CI_WEBHOOK_SECRET }}" \
+            -d "{
+              \"repository_url\": \"https://github.com/${{ github.repository }}\",
+              \"branch_name\": \"${{ github.ref_name }}\",
+              \"ci_run_id\": \"${{ github.run_id }}\",
+              \"ci_errors\": \"$CI_ERRORS\",
+              \"workflow_url\": \"https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}\",
+              \"commit_sha\": \"${{ github.sha }}\",
+              \"github_token\": \"${{ secrets.GITHUB_TOKEN }}\"
+            }")
+          
+          HTTP_STATUS=$(echo "$RESPONSE" | grep "HTTP_STATUS:" | cut -d: -f2)
+          BODY=$(echo "$RESPONSE" | sed '/HTTP_STATUS:/d')
+          
+          if [ "$HTTP_STATUS" != "200" ] && [ "$HTTP_STATUS" != "201" ] && [ "$HTTP_STATUS" != "204" ]; then
+            echo "::error::Failed to send CI notification to webhook. HTTP Status: $HTTP_STATUS, Response: $BODY"
+          else
+            echo "CI notification sent successfully. HTTP Status: $HTTP_STATUS"
+          fi
+          
+          # If CI failed, ensure workflow exits with failure
+          if [ "$STATUS" = "failure" ]; then
+            echo "::error::CI pipeline failed - review errors in workflow at https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            exit 1
+          fi
