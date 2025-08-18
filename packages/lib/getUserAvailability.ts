@@ -580,20 +580,20 @@ const _getUserAvailability = async function getUsersWorkingHoursLifeTheUniverseA
 
   const datesOutOfOffice: IOutOfOfficeData = calculateOutOfOfficeRanges(outOfOfficeDays, availability);
 
+  // FIX: Apply travel schedules to ALL schedules, not just default schedule
+  // This ensures that travel timezone adjustments work for all availability schedules
   const { dateRanges, oooExcludedDateRanges } = buildDateRanges({
     dateFrom,
     dateTo,
     availability,
     timeZone,
-    travelSchedules: isDefaultSchedule
-      ? user.travelSchedules.map((schedule) => {
-          return {
-            startDate: dayjs(schedule.startDate),
-            endDate: schedule.endDate ? dayjs(schedule.endDate) : undefined,
-            timeZone: schedule.timeZone,
-          };
-        })
-      : [],
+    travelSchedules: user.travelSchedules.map((schedule) => {
+      return {
+        startDate: dayjs(schedule.startDate),
+        endDate: schedule.endDate ? dayjs(schedule.endDate) : undefined,
+        timeZone: schedule.timeZone,
+      };
+    }),
     outOfOffice: datesOutOfOffice,
   });
 
