@@ -18,6 +18,7 @@ import { MembershipRepository } from "@calcom/lib/server/repository/membership";
 import { ScheduleRepository } from "@calcom/lib/server/repository/schedule";
 import { HashedLinkService } from "@calcom/lib/server/service/hashedLinkService";
 import { validateBookerLayouts } from "@calcom/lib/validateBookerLayouts";
+import { validateAllowedTimezones } from "@calcom/lib/validateAllowedTimezones";
 import type { PrismaClient } from "@calcom/prisma";
 import { WorkflowTriggerEvents } from "@calcom/prisma/client";
 import { SchedulingType, EventTypeAutoTranslatedField, RRTimestampBasis } from "@calcom/prisma/enums";
@@ -312,6 +313,17 @@ export const updateHandler = async ({ ctx, input }: UpdateOptions) => {
     throw new TRPCError({ code: "BAD_REQUEST", message: t(bookerLayoutsError) });
   }
 
+  // Validate allowedTimezones if provided in metadata
+  if (input.metadata?.allowedTimezones) {
+    const timezoneValidation = validateAllowedTimezones(input.metadata.allowedTimezones);
+    if (!timezoneValidation.isValid) {
+      throw new TRPCError({ 
+        code: "BAD_REQUEST", 
+        message: timezoneValidation.error || "Invalid timezone(s) provided" 
+      });
+    }
+  }
+
   if (schedule) {
     // Check that the schedule belongs to the user
     const userScheduleQuery = await ctx.prisma.schedule.findFirst({
@@ -349,103 +361,155 @@ export const updateHandler = async ({ ctx, input }: UpdateOptions) => {
 
   const membershipRepo = new MembershipRepository(ctx.prisma);
 
-  if (restrictionScheduleId) {
-    // Verify that the user owns the restriction schedule or is a team member
-    const scheduleRepo = new ScheduleRepository(ctx.prisma);
-    const restrictionSchedule = await scheduleRepo.findScheduleByIdForOwnershipCheck({
-      scheduleId: restrictionScheduleId,
-    });
-    // If the user doesn't own the schedule, check if they're a team member
-    if (restrictionSchedule?.userId !== ctx.user.id) {
-      if (!teamId || !restrictionSchedule) {
-        throw new TRPCError({
-          code: "UNAUTHORIZED",
-          message: "The restriction schedule is not owned by you or your team",
-        });
-      }
-      const hasMembership = await membershipRepo.hasMembership({
-        teamId,
-        userId: restrictionSchedule.userId,
-      });
-      if (!hasMembership) {
-        throw new TRPCError({
-          code: "UNAUTHORIZED",
-          message: "The restriction schedule is not owned by you or your team",
-        });
-      }
-    }
-
-    data.restrictionSchedule = {
-      connect: {
-        id: restrictionScheduleId,
-      },
-    };
-  } else if (restrictionScheduleId === null || restrictionScheduleId === 0) {
-    data.restrictionSchedule = {
-      disconnect: true,
-    };
-  }
-
-  if (users?.length) {
+  // Load all users added to this event type
+  if (users) {
     data.users = {
       set: [],
-      connect: users.map((userId: number) => ({ id: userId })),
+      connect: users.map((userId) => ({ id: userId })),
     };
   }
 
   if (teamId && hosts) {
-    // check if all hosts can be assigned (memberships that have accepted invite)
-    const teamMemberIds = await membershipRepo.listAcceptedTeamMemberIds({ teamId });
-    // guard against missing IDs, this may mean a member has just been removed
-    // or this request was forged.
-    // we let this pass through on organization sub-teams
-    if (!hosts.every((host) => teamMemberIds.includes(host.userId)) && !eventType.team?.parentId) {
+    const teamMemberIds = await membershipRepo.findMemberIdsCanConfigureEventTypes(teamId);
+    const teamMemberIdsIncludingNullUserId = teamMemberIds
+      .filter((teamMemberId): teamMemberId is number => teamMemberId !== null)
+      .map((teamMemberId) => ({ userId: teamMemberId }));
+    const weCanCreateJustForMemberIds = hosts.filter((host) => teamMemberIds.includes(host.userId));
+    const hostIds = weCanCreateJustForMemberIds.map((host) => host.userId);
+    data.hosts = {
+      deleteMany: {},
+      create: weCanCreateJustForMemberIds.map((host) => ({
+        ...host,
+        scheduleId: host.scheduleId || undefined,
+        isFixed: host.priority !== 2 && host.isFixed,
+      })),
+    };
+
+    if (weCanCreateJustForMemberIds.length !== hosts.length) {
+      // Mismatch between hosts submitted and hosts that can be created for this team
+      const removedHostIds = hosts.filter((host) => !hostIds.includes(host.userId)).map((host) => host.userId);
+      const removedHostNames = eventType.team?.members
+        .filter((member) => removedHostIds.includes(member.user.id))
+        .map((member) => member.user.name || member.user.id);
       throw new TRPCError({
         code: "FORBIDDEN",
+        message: `You don't have permission to add ${removedHostNames?.join(", ")} to this event type.`,
       });
     }
 
-    // weights were already enabled or are enabled now
-    const isWeightsEnabled =
-      isRRWeightsEnabled || (typeof isRRWeightsEnabled === "undefined" && eventType.isRRWeightsEnabled);
+    // If all team members are given same priority then or
+    if ((hosts.some((host) => host.priority === 1) || hosts.every((host) => host.priority === null))) {
+      // @TODO: FIND ME A BETTER PLACE
+      if (assignAllTeamMembers && eventType.team?.parentId) {
+        const membersWithoutHost = await membershipRepo.findMembersWithoutHost(eventType.team.id);
+        const usersNotInHosts = membersWithoutHost.filter(
+          (userId) => !teamMemberIdsIncludingNullUserId.find((host) => host.userId === userId)
+        );
+        if (usersNotInHosts.length > 0) {
+          data.hosts = {
+            deleteMany: {},
+            create: [
+              ...weCanCreateJustForMemberIds.map((host) => ({
+                ...host,
+                isFixed: host.priority !== 2 && host.isFixed,
+                scheduleId: host.scheduleId || undefined,
+              })),
+              ...usersNotInHosts.map((userId) => ({
+                userId: userId,
+                isFixed: false,
+              })),
+            ],
+          };
+        }
+      }
 
-    const oldHostsSet = new Set(eventType.hosts.map((oldHost) => oldHost.userId));
-    const newHostsSet = new Set(hosts.map((oldHost) => oldHost.userId));
+      const scheduleRepository = new ScheduleRepository(ctx.prisma);
+      if (weCanCreateJustForMemberIds.length === 1 && !eventType.team?.parentId) {
+        const userId = weCanCreateJustForMemberIds[0].userId;
+        const defaultScheduleId = await scheduleRepository.getDefaultByUserId(userId);
+        data.schedule = { connect: { id: defaultScheduleId } };
+      } else {
+        data.schedulingType = SchedulingType.ROUND_ROBIN;
+      }
+    }
+  }
 
-    const existingHosts = hosts.filter((newHost) => oldHostsSet.has(newHost.userId));
-    const newHosts = hosts.filter((newHost) => !oldHostsSet.has(newHost.userId));
-    const removedHosts = eventType.hosts.filter((oldHost) => !newHostsSet.has(oldHost.userId));
+  // Only validate team's event type children
+  if (teamId && children && children.length) {
+    const assignedUsers = children
+      .map((ch) => ch.owner)
+      .filter((owner): owner is (typeof owner & { id: number }) => owner?.id !== undefined)
+      .map((owner) => owner.id);
+    const teamMembers = await ctx.prisma.membership.findMany({
+      where: {
+        teamId,
+        userId: {
+          in: assignedUsers,
+        },
+        accepted: true,
+      },
+    });
+    const teamMemberIds = teamMembers.map((member) => member.userId);
 
-    data.hosts = {
+    // To prevent making some unintended changes, we let users do it on purpose from event type page
+    children = children.filter((ch) => {
+      const childrenOwnerInTeam = !!ch.owner?.id && teamMemberIds.includes(ch.owner.id);
+      const existedBeforeAsChild = eventType.children.find((child) => child.userId === ch.owner?.id);
+      return childrenOwnerInTeam || existedBeforeAsChild;
+    });
+
+    // Store children
+    const currentChildrenWithUserId = eventType.children.filter((ch) => ch.userId !== null).map((ch) => ch.userId);
+    const deleteChildrenIds = currentChildrenWithUserId.filter(
+      (id) => !children.map((ch) => ch.owner?.id).includes(id)
+    );
+    const createChildren = children.filter(
+      (ch) => ch.owner?.id && !currentChildrenWithUserId.includes(ch.owner?.id)
+    );
+    data.children = {
       deleteMany: {
-        OR: removedHosts.map((host) => ({
-          userId: host.userId,
-          eventTypeId: id,
+        userId: {
+          in: deleteChildrenIds as number[],
+        },
+      },
+      createMany: {
+        data: createChildren.map((ch) => ({
+          hidden: ch.hidden,
+          owner: {
+            connect: {
+              id: ch.owner?.id || 0,
+            },
+          },
         })),
       },
-      create: newHosts.map((host) => {
-        return {
-          ...host,
-          isFixed: data.schedulingType === SchedulingType.COLLECTIVE || host.isFixed,
-          priority: host.priority ?? 2,
-          weight: host.weight ?? 100,
-        };
-      }),
-      update: existingHosts.map((host) => ({
-        where: {
-          userId_eventTypeId: {
-            userId: host.userId,
-            eventTypeId: id,
-          },
-        },
-        data: {
-          isFixed: data.schedulingType === SchedulingType.COLLECTIVE || host.isFixed,
-          priority: host.priority ?? 2,
-          weight: host.weight ?? 100,
-          scheduleId: host.scheduleId ?? null,
-        },
-      })),
     };
+  }
+
+  if (restrictionScheduleId) {
+    if (restrictionScheduleId < 0) {
+      data.restrictionSchedule = {
+        disconnect: true,
+      };
+    } else {
+      const restrictionScheduleBelongsToUser = await ctx.prisma.schedule.findFirst({
+        where: {
+          userId: ctx.user.id,
+          id: restrictionScheduleId,
+        },
+      });
+      if (restrictionScheduleBelongsToUser) {
+        data.restrictionSchedule = {
+          connect: {
+            id: restrictionScheduleId,
+          },
+        };
+      } else {
+        throw new TRPCError({
+          code: "BAD_REQUEST",
+          message: "Schedule doesn't belong to the user",
+        });
+      }
+    }
   }
 
   if (input.metadata?.disableStandardEmails?.all) {
