@@ -16,6 +16,7 @@ import { markdownToSafeHTMLClient } from "@calcom/lib/markdownToSafeHTMLClient";
 import { CURRENT_TIMEZONE } from "@calcom/lib/timezoneConstants";
 import type { EventTypeTranslation } from "@calcom/prisma/client";
 import { EventTypeAutoTranslatedField } from "@calcom/prisma/enums";
+import type { EventTypeMetadata } from "@calcom/prisma/zod-utils";
 
 import i18nConfigration from "../../../../../i18n.json";
 import { fadeInUp } from "../config";
@@ -111,6 +112,13 @@ export const EventMeta = ({
     () => (isPlatform ? [PlatformTimezoneSelect] : [WebTimezoneSelect]),
     [isPlatform]
   );
+
+  // Extract allowedTimezones from event metadata
+  const allowedTimezones = useMemo(() => {
+    if (!event?.metadata) return undefined;
+    const metadata = event.metadata as EventTypeMetadata;
+    return metadata?.allowedTimezones;
+  }, [event?.metadata]);
 
   useEffect(() => {
     //In case the event has lockTimeZone enabled ,set the timezone to event's locked timezone
@@ -225,6 +233,7 @@ export const EventMeta = ({
                   data-testid="event-meta-current-timezone">
                   <TimezoneSelect
                     timeZones={timeZones}
+                    allowedTimezones={allowedTimezones}
                     menuPosition="absolute"
                     timezoneSelectCustomClassname={classNames?.eventMetaTimezoneSelect}
                     classNames={{

@@ -38,6 +38,7 @@ export type TimezoneSelectProps = SelectProps & {
   timezoneSelectCustomClassname?: string;
   size?: "sm" | "md";
   grow?: boolean;
+  allowedTimezones?: string[];
 };
 export function TimezoneSelect(props: TimezoneSelectProps) {
   const { data = [], isPending } = trpc.viewer.timezones.cityTimezones.useQuery(
@@ -67,6 +68,7 @@ export type TimezoneSelectComponentProps = SelectProps & {
   size?: "sm" | "md";
   grow?: boolean;
   isWebTimezoneSelect?: boolean;
+  allowedTimezones?: string[];
 };
 
 // TODO: I wonder if we move this to ui package, and keep the TRPC version in features
@@ -81,9 +83,16 @@ export function TimezoneSelectComponent({
   size = "md",
   grow = false,
   isWebTimezoneSelect = true,
+  allowedTimezones,
   ...props
 }: TimezoneSelectComponentProps) {
-  const data = [...(props.data || [])];
+  let data = [...(props.data || [])];
+  
+  // Filter timezones if allowedTimezones is provided
+  if (allowedTimezones && allowedTimezones.length > 0) {
+    data = data.filter((tz) => allowedTimezones.includes(tz.timezone));
+  }
+  
   /*
    * we support multiple timezones for the different labels
    * e.g. 'Sao Paulo' and 'Brazil Time' both being 'America/Sao_Paulo'
@@ -93,7 +102,15 @@ export function TimezoneSelectComponent({
    */
   const [additionalTimezones, setAdditionalTimezones] = useState<Timezones>([]);
   const handleInputChange = (searchText: string) => {
-    if (data) setAdditionalTimezones(filterBySearchText(searchText, data));
+    if (data) {
+      const searchResults = filterBySearchText(searchText, data);
+      // Also filter search results by allowedTimezones if provided
+      if (allowedTimezones && allowedTimezones.length > 0) {
+        setAdditionalTimezones(searchResults.filter((tz) => allowedTimezones.includes(tz.timezone)));
+      } else {
+        setAdditionalTimezones(searchResults);
+      }
+    }
   };
 
   const reactSelectProps = useMemo(() => {
@@ -101,6 +118,25 @@ export function TimezoneSelectComponent({
       components: components || {},
     });
   }, [components]);
+
+  // Build the timezones object for BaseSelect, filtering by allowedTimezones if provided
+  const timezonesForSelect = useMemo(() => {
+    const baseTimezones = props.data ? addTimezonesToDropdown(data) : {};
+    const additionalTz = isWebTimezoneSelect ? addTimezonesToDropdown(additionalTimezones) : {};
+    
+    // If allowedTimezones is provided, filter the final object
+    if (allowedTimezones && allowedTimezones.length > 0) {
+      const filteredTimezones: Record<string, string> = {};
+      for (const [key, label] of Object.entries({ ...baseTimezones, ...additionalTz })) {
+        if (allowedTimezones.includes(key)) {
+          filteredTimezones[key] = label as string;
+        }
+      }
+      return filteredTimezones;
+    }
+    
+    return { ...baseTimezones, ...additionalTz };
+  }, [props.data, data, isWebTimezoneSelect, additionalTimezones, allowedTimezones]);
 
   return (
     <BaseSelect
@@ -111,10 +147,7 @@ export function TimezoneSelectComponent({
       data-testid="timezone-select"
       isDisabled={isPending}
       {...reactSelectProps}
-      timezones={{
-        ...(props.data ? addTimezonesToDropdown(data) : {}),
-        ...(isWebTimezoneSelect ? addTimezonesToDropdown(additionalTimezones) : {}),
-      }}
+      timezones={timezonesForSelect}
       styles={{
         control: (base) => ({
           ...base,
